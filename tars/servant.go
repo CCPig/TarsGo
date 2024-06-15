@@ -14,7 +14,6 @@ import (
 	"github.com/TarsCloud/TarsGo/tars/protocol/res/requestf"
 	"github.com/TarsCloud/TarsGo/tars/util/current"
 	"github.com/TarsCloud/TarsGo/tars/util/endpoint"
-	"github.com/TarsCloud/TarsGo/tars/util/rtimer"
 	"github.com/TarsCloud/TarsGo/tars/util/tools"
 )
 
@@ -50,7 +49,12 @@ func NewServantProxy(comm *Communicator, objName string, opts ...EndpointManager
 }
 
 func newServantProxy(comm *Communicator, objName string, opts ...EndpointManagerOption) *ServantProxy {
-	s := &ServantProxy{}
+	s := &ServantProxy{
+		comm:    comm,
+		proto:   &protocol.TarsProtocol{},
+		timeout: comm.Client.AsyncInvokeTimeout,
+		version: basef.TARSVERSION,
+	}
 	pos := strings.Index(objName, "@")
 	if pos > 0 {
 		s.name = objName[0:pos]
@@ -64,10 +68,6 @@ func newServantProxy(comm *Communicator, objName string, opts ...EndpointManager
 
 	// init manager
 	s.manager = GetManager(comm, objName, opts...)
-	s.comm = comm
-	s.proto = &protocol.TarsProtocol{}
-	s.timeout = s.comm.Client.AsyncInvokeTimeout
-	s.version = basef.TARSVERSION
 	return s
 }
 
@@ -91,6 +91,11 @@ func (s *ServantProxy) TarsSetProtocol(proto model.Protocol) {
 	s.proto = proto
 }
 
+// Endpoints returns all active endpoint.Endpoint
+func (s *ServantProxy) Endpoints() []*endpoint.Endpoint {
+	return s.manager.GetAllEndpoint()
+}
+
 // 生成请求 ID
 func (s *ServantProxy) genRequestID() int32 {
 	// 尽力防止溢出
@@ -107,7 +112,7 @@ func (s *ServantProxy) genRequestID() int32 {
 func (s *ServantProxy) TarsPing(ctx context.Context) {
 	req := requestf.RequestPacket{
 		IVersion:     s.version,
-		CPacketType:  int8(basef.TARSONEWAY),
+		CPacketType:  basef.TARSONEWAY,
 		IRequestId:   s.genRequestID(),
 		SServantName: s.name,
 		SFuncName:    "tars_ping",
@@ -134,12 +139,10 @@ func (s *ServantProxy) SetPushCallback(callback func([]byte)) {
 	s.pushCallback = callback
 }
 
-// SetPushCallback set callback function for pushing
 func (s *ServantProxy) SetOnConnectCallback(callback func(string)) {
 	s.onConnectCallback = callback
 }
 
-// SetPushCallback set callback function for pushing
 func (s *ServantProxy) SetOnCloseCallback(callback func(string)) {
 	s.onCloseCallback = callback
 }
@@ -165,8 +168,8 @@ func (s *ServantProxy) TarsInvoke(ctx context.Context, cType byte,
 	}
 
 	// 将ctx中的trace信息传入到request中
-	if traceData, ok := current.GetTraceData(ctx); ok && traceData.TraceCall {
-		traceKey := traceData.GetTraceKeyFull(false)
+	if trace, ok := current.GetTarsTrace(ctx); ok && trace.Call() {
+		traceKey := trace.GetTraceFullKey(false)
 		TLOG.Debug("trace debug: find trace key:", traceKey)
 		if status == nil {
 			status = make(map[string]string)
@@ -190,27 +193,37 @@ func (s *ServantProxy) TarsInvoke(ctx context.Context, cType byte,
 	msg := &Message{Req: &req, Ser: s, Resp: resp}
 	msg.Init()
 
-	timeout := time.Duration(s.timeout) * time.Millisecond
 	if ok, hashType, hashCode, isHash := current.GetClientHash(ctx); ok {
 		msg.isHash = isHash
 		msg.hashType = HashType(hashType)
 		msg.hashCode = hashCode
 	}
 
+	timeout := time.Duration(s.timeout) * time.Millisecond
 	if ok, to, isTimeout := current.GetClientTimeout(ctx); ok && isTimeout {
 		timeout = time.Duration(to) * time.Millisecond
 		req.ITimeout = int32(to)
 	}
+	// timeout delivery
+	if dl, ok := ctx.Deadline(); ok {
+		timeout = time.Until(dl)
+		req.ITimeout = int32(timeout / time.Millisecond)
+	} else {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
 
 	var err error
 	s.manager.preInvoke()
-	if allFilters.cf != nil {
-		err = allFilters.cf(ctx, msg, s.doInvoke, timeout)
-	} else if cf := getMiddlewareClientFilter(); cf != nil {
+	app := s.comm.app
+	if app.allFilters.cf != nil {
+		err = app.allFilters.cf(ctx, msg, s.doInvoke, timeout)
+	} else if cf := app.getMiddlewareClientFilter(); cf != nil {
 		err = cf(ctx, msg, s.doInvoke, timeout)
 	} else {
 		// execute pre client filters
-		for i, v := range allFilters.preCfs {
+		for i, v := range app.allFilters.preCfs {
 			err = v(ctx, msg, s.doInvoke, timeout)
 			if err != nil {
 				TLOG.Errorf("Pre filter error, no: %v, err: %v", i, err.Error())
@@ -219,7 +232,7 @@ func (s *ServantProxy) TarsInvoke(ctx context.Context, cType byte,
 		// execute rpc
 		err = s.doInvoke(ctx, msg, timeout)
 		// execute post client filters
-		for i, v := range allFilters.postCfs {
+		for i, v := range app.allFilters.postCfs {
 			filterErr := v(ctx, msg, s.doInvoke, timeout)
 			if filterErr != nil {
 				TLOG.Errorf("Post filter error, no: %v, err: %v", i, filterErr.Error())
@@ -288,7 +301,7 @@ func (s *ServantProxy) doInvoke(ctx context.Context, msg *Message, timeout time.
 		return nil
 	}
 	select {
-	case <-rtimer.After(timeout):
+	case <-ctx.Done():
 		msg.Status = basef.TARSINVOKETIMEOUT
 		adp.failAdd()
 		msg.End()

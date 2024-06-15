@@ -13,12 +13,12 @@ import (
 var (
 	// ReportStat set the default stater(default is `ReportStatFromClient`).
 	ReportStat reportStatFunc = ReportStatFromClient
-	timePoint                 = []int32{5, 10, 50, 100, 200, 500, 1000, 2000, 3000}
+	timePoint                 = [...]int32{5, 10, 50, 100, 200, 500, 1000, 2000, 3000}
 )
 
 type reportStatFunc func(msg *Message, succ int32, timeout int32, exec int32)
 
-// StatInfo struct contains stat info' head and body.
+// StatInfo struct contains stat info head and body.
 type StatInfo struct {
 	Head statf.StatMicMsgHead
 	Body statf.StatMicMsgBody
@@ -29,6 +29,7 @@ type StatFHelper struct {
 	chStatInfo           chan StatInfo
 	mStatInfo            map[statf.StatMicMsgHead]statf.StatMicMsgBody
 	mStatCount           map[statf.StatMicMsgHead]int
+	app                  *application
 	comm                 *Communicator
 	sf                   *statf.StatF
 	servant              string
@@ -37,15 +38,21 @@ type StatFHelper struct {
 	mStatCountFromServer map[statf.StatMicMsgHead]int
 }
 
+func newStatFHelper(app *application) *StatFHelper {
+	return &StatFHelper{
+		chStatInfo:           make(chan StatInfo, app.ServerConfig().StatReportChannelBufLen),
+		mStatInfo:            make(map[statf.StatMicMsgHead]statf.StatMicMsgBody),
+		mStatCount:           make(map[statf.StatMicMsgHead]int),
+		app:                  app,
+		chStatInfoFromServer: make(chan StatInfo, app.ServerConfig().StatReportChannelBufLen),
+		mStatInfoFromServer:  make(map[statf.StatMicMsgHead]statf.StatMicMsgBody),
+		mStatCountFromServer: make(map[statf.StatMicMsgHead]int),
+	}
+}
+
 // Init the StatFHelper
 func (s *StatFHelper) Init(comm *Communicator, servant string) {
 	s.servant = servant
-	s.chStatInfo = make(chan StatInfo, GetServerConfig().StatReportChannelBufLen)
-	s.chStatInfoFromServer = make(chan StatInfo, GetServerConfig().StatReportChannelBufLen)
-	s.mStatInfo = make(map[statf.StatMicMsgHead]statf.StatMicMsgBody)
-	s.mStatCount = make(map[statf.StatMicMsgHead]int)
-	s.mStatInfoFromServer = make(map[statf.StatMicMsgHead]statf.StatMicMsgBody)
-	s.mStatCountFromServer = make(map[statf.StatMicMsgHead]int)
 	s.comm = comm
 	s.sf = new(statf.StatF)
 	s.comm.StringToProxy(s.servant, s.sf)
@@ -108,7 +115,7 @@ func (s *StatFHelper) getIntervCount(totalRspTime int32, intervalCount map[int32
 func (s *StatFHelper) reportAndClear(mStat string, bFromClient bool) {
 	// report mStatInfo
 	if mStat == "mStatInfo" {
-		_, err := s.sf.ReportMicMsg(s.mStatInfo, bFromClient)
+		_, err := s.sf.ReportMicMsg(s.mStatInfo, bFromClient, s.comm.Client.Context())
 		if err != nil {
 			TLOG.Debug("mStatInfo report err:", err.Error())
 		}
@@ -117,7 +124,7 @@ func (s *StatFHelper) reportAndClear(mStat string, bFromClient bool) {
 	}
 	// report mStatInfoFromServer
 	if mStat == "mStatInfoFromServer" {
-		_, err := s.sf.ReportMicMsg(s.mStatInfoFromServer, bFromClient)
+		_, err := s.sf.ReportMicMsg(s.mStatInfoFromServer, bFromClient, s.comm.Client.Context())
 		if err != nil {
 			TLOG.Debug("mStatInfoFromServer report err:", err.Error())
 		}
@@ -128,7 +135,7 @@ func (s *StatFHelper) reportAndClear(mStat string, bFromClient bool) {
 
 // Run stat report loop
 func (s *StatFHelper) Run() {
-	ticker := time.NewTicker(GetServerConfig().StatReportInterval)
+	ticker := time.NewTicker(s.app.ServerConfig().StatReportInterval)
 	for {
 		select {
 		case stStatInfo := <-s.chStatInfo:
@@ -160,19 +167,21 @@ func (s *StatFHelper) ReportMicMsg(stStatInfo StatInfo, fromServer bool) {
 }
 
 // StatReport instance pointer of StatFHelper
-var StatReport *StatFHelper
-var statInited = make(chan struct{}, 1)
-var statInitOnce sync.Once
+var (
+	StatReport   *StatFHelper
+	statInited   = make(chan struct{}, 1)
+	statInitOnce sync.Once
+)
 
-func initReport() error {
-	cfg := GetClientConfig()
-	if cfg.Stat == "" || (cfg.Locator == "" && !strings.Contains(cfg.Stat, "@")) {
+func initReport(app *application) error {
+	cfg := app.ClientConfig()
+	if err := cfg.ValidateStat(); err != nil {
 		statInited <- struct{}{}
-		return fmt.Errorf("stat init error")
+		return err
 	}
-	comm := NewCommunicator()
-	StatReport = new(StatFHelper)
-	StatReport.Init(comm, GetClientConfig().Stat)
+	comm := app.Communicator()
+	StatReport = newStatFHelper(app)
+	StatReport.Init(comm, cfg.Stat)
 	statInited <- struct{}{}
 	go StatReport.Run()
 	return nil
@@ -180,12 +189,15 @@ func initReport() error {
 
 // ReportStatBase is base method for report statistics.
 func ReportStatBase(head *statf.StatMicMsgHead, body *statf.StatMicMsgBody, FromServer bool) {
-	statInfo := StatInfo{Head: *head, Body: *body}
-	statInfo.Head.TarsVersion = Version
-	// statInfo.Head.IStatVer = 2
-	if StatReport != nil {
-		StatReport.ReportMicMsg(statInfo, FromServer)
+	if StatReport == nil {
+		return
 	}
+	statInfo := StatInfo{Head: *head, Body: *body}
+	if statInfo.Head.TarsVersion == "" {
+		statInfo.Head.TarsVersion = Version
+	}
+	// statInfo.Head.IStatVer = 2
+	StatReport.ReportMicMsg(statInfo, FromServer)
 }
 
 // ReportStatFromClient report the statics from client.

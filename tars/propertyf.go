@@ -1,7 +1,6 @@
 package tars
 
 import (
-	"fmt"
 	"reflect"
 	"sort"
 	"strconv"
@@ -10,7 +9,7 @@ import (
 	"time"
 
 	"github.com/TarsCloud/TarsGo/tars/protocol/res/propertyf"
-	sync2 "github.com/TarsCloud/TarsGo/tars/util/sync"
+	utilSync "github.com/TarsCloud/TarsGo/tars/util/sync"
 	"github.com/TarsCloud/TarsGo/tars/util/tools"
 )
 
@@ -64,8 +63,8 @@ type Sum struct {
 func NewSum() *Sum {
 	return &Sum{
 		data:  0,
-		mlock: new(sync.Mutex)}
-
+		mlock: new(sync.Mutex),
+	}
 }
 
 // Enum return the report policy
@@ -150,7 +149,8 @@ type Max struct {
 func NewMax() *Max {
 	return &Max{
 		data:  -9999999,
-		mlock: new(sync.Mutex)}
+		mlock: new(sync.Mutex),
+	}
 }
 
 // Enum return the report policy
@@ -191,7 +191,6 @@ func NewMin() *Min {
 		data:  0,
 		mlock: new(sync.Mutex),
 	}
-
 }
 
 // Enum return the report policy
@@ -208,15 +207,15 @@ func (m *Min) Set(in int) {
 	}
 }
 
-// Get get the min value for the Min struct.
+// Get returns the min value for the Min struct.
 func (m *Min) Get() (out string) {
 	m.mlock.Lock()
 	defer m.mlock.Unlock()
 	out = strconv.Itoa(m.data)
 	m.clear()
 	return
-
 }
+
 func (m *Min) clear() {
 	m.data = 0
 }
@@ -320,9 +319,28 @@ type PropertyReportHelper struct {
 	node       string
 }
 
-// ProHelper is global PropertyReportHelper instance
-var ProHelper *PropertyReportHelper
-var proOnce sync2.Once
+var (
+	// ProHelper is global PropertyReportHelper instance
+	ProHelper *PropertyReportHelper
+	proOnce   utilSync.Once
+)
+
+func newPropertyReportHelper(comm *Communicator, node string) *PropertyReportHelper {
+	p := new(PropertyReportHelper)
+	p.Init(comm, node)
+	return p
+}
+
+func initProReport() error {
+	cfg := GetClientConfig()
+	if err := cfg.ValidateProperty(); err != nil {
+		return err
+	}
+	comm := GetCommunicator()
+	ProHelper = newPropertyReportHelper(comm, cfg.Property)
+	go ProHelper.Run()
+	return nil
+}
 
 // ReportToServer report to the remote propertyreport server.
 func (p *PropertyReportHelper) ReportToServer() {
@@ -407,7 +425,7 @@ func (p *PropertyReportHelper) ReportToServer() {
 	for k, v := range statMsg {
 		cnt++
 		if cnt >= 20 {
-			_, err := p.pf.ReportPropMsg(tmpStatMsg)
+			_, err := p.pf.ReportPropMsg(tmpStatMsg, p.comm.Client.Context())
 			if err != nil {
 				TLOG.Error("Send to property server Error", reflect.TypeOf(err), err)
 			}
@@ -416,7 +434,7 @@ func (p *PropertyReportHelper) ReportToServer() {
 		tmpStatMsg[k] = v
 	}
 	if len(tmpStatMsg) > 0 {
-		_, err := p.pf.ReportPropMsg(tmpStatMsg)
+		_, err := p.pf.ReportPropMsg(tmpStatMsg, p.comm.Client.Context())
 		if err != nil {
 			TLOG.Error("Send to property server Error", reflect.TypeOf(err), err)
 		}
@@ -430,18 +448,6 @@ func (p *PropertyReportHelper) Init(comm *Communicator, node string) {
 	p.pf = new(propertyf.PropertyF)
 	p.reportPtrs = new(sync.Map)
 	p.comm.StringToProxy(p.node, p.pf)
-}
-
-func initProReport() error {
-	cfg := GetClientConfig()
-	if cfg.Property == "" || (cfg.Locator == "" && !strings.Contains(cfg.Property, "@")) {
-		return fmt.Errorf("property emptry")
-	}
-	comm := NewCommunicator()
-	ProHelper = new(PropertyReportHelper)
-	ProHelper.Init(comm, GetClientConfig().Property)
-	go ProHelper.Run()
-	return nil
 }
 
 // AddToReport adds the user's PropertyReport to the PropertyReportHelper

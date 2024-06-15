@@ -2,12 +2,13 @@ package base
 
 import (
 	"bytes"
-	"github.com/TarsCloud/TarsGo/tars/tools/tarsgo/internal/bindata"
-	"github.com/TarsCloud/TarsGo/tars/tools/tarsgo/internal/consts"
 	"os"
 	"path"
 	"strings"
 	"text/template"
+
+	"github.com/TarsCloud/TarsGo/tars/tools/tarsgo/internal/bindata"
+	"github.com/TarsCloud/TarsGo/tars/tools/tarsgo/internal/consts"
 )
 
 const (
@@ -64,7 +65,7 @@ make
 ./{{.Server}} --config=config/config.conf
 `
 
-	makefileTemplateFile = "makefile"
+	makefileTemplateFile = "Makefile"
 	makefileTemplate     = `APP       := {{.App}}
 TARGET    := {{.Server}}
 MFLAGS    :=
@@ -73,7 +74,7 @@ CONFIG    := client
 STRIP_FLAG:= N
 J2GO_FLAG:= 
 
--include scripts/makefile.tars.gomod
+-include scripts/makefile.tars.gomod.mk
 `
 
 	mainGoTemplateFile = "main.go"
@@ -282,5 +283,5 @@ func DoGenProject(p *Project, to string, mgrType string) error {
 	if mgrType == consts.CMake {
 		return bindata.RestoreAssets(to, "cmake")
 	}
-	return bindata.RestoreAsset(to, "scripts/makefile.tars.gomod")
+	return bindata.RestoreAsset(to, "scripts/makefile.tars.gomod.mk")
 }

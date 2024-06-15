@@ -1,26 +1,13 @@
 package tars
 
 import (
+	"fmt"
+	"strings"
 	"time"
 
 	"github.com/TarsCloud/TarsGo/tars/util/endpoint"
 	"github.com/TarsCloud/TarsGo/tars/util/tools"
 )
-
-var svrCfg *serverConfig
-var cltCfg *clientConfig
-
-// GetServerConfig Get server config
-func GetServerConfig() *serverConfig {
-	Init()
-	return svrCfg
-}
-
-// GetClientConfig Get client config
-func GetClientConfig() *clientConfig {
-	Init()
-	return cltCfg
-}
 
 type adapterConfig struct {
 	Endpoint endpoint.Endpoint
@@ -38,6 +25,7 @@ type serverConfig struct {
 	LogNum   uint64
 	LogLevel string
 	Version  string
+	NodeName string
 	LocalIP  string
 	Local    string
 	BasePath string
@@ -104,30 +92,59 @@ type clientConfig struct {
 	ClientDialTimeout  time.Duration
 	ReqDefaultTimeout  int32
 	ObjQueueMax        int32
+	context            map[string]string
+}
+
+// GetServerConfig Get server config
+func GetServerConfig() *serverConfig {
+	return defaultApp.ServerConfig()
+}
+
+// GetClientConfig Get client config
+func GetClientConfig() *clientConfig {
+	return defaultApp.ClientConfig()
+}
+
+func (c *clientConfig) ValidateStat() error {
+	if c.Stat == "" || (c.LocatorEmpty() && !strings.Contains(c.Stat, "@")) {
+		return fmt.Errorf("stat config emptry")
+	}
+	return nil
+}
+
+func (c *clientConfig) ValidateProperty() error {
+	if c.Property == "" || (c.LocatorEmpty() && !strings.Contains(c.Property, "@")) {
+		return fmt.Errorf("property config emptry")
+	}
+	return nil
+}
+
+func (c *clientConfig) LocatorEmpty() bool {
+	return c.Locator == ""
+}
+
+// ServerConfig returns server config
+func (a *application) ServerConfig() *serverConfig {
+	a.init()
+	return a.svrCfg
+}
+
+// ClientConfig returns client config
+func (a *application) ClientConfig() *clientConfig {
+	a.init()
+	return a.cltCfg
 }
 
 func newServerConfig() *serverConfig {
 	return &serverConfig{
-		Node:                    "",
-		App:                     "",
-		Server:                  "",
-		LogPath:                 "",
 		LogSize:                 defaultRotateSizeMB,
 		LogNum:                  defaultRotateN,
 		LogLevel:                "INFO",
 		Version:                 Version,
 		LocalIP:                 tools.GetLocalIP(),
-		Local:                   "",
-		BasePath:                "",
-		DataPath:                "",
-		Config:                  "",
-		Notify:                  "",
-		Log:                     "",
 		Adapters:                make(map[string]adapterConfig),
-		Container:               "",
 		Isdocker:                false,
 		Enableset:               false,
-		Setdivision:             "",
 		AcceptTimeout:           tools.ParseTimeOut(AcceptTimeout),
 		ReadTimeout:             tools.ParseTimeOut(ReadTimeout),
 		WriteTimeout:            tools.ParseTimeOut(ReadTimeout),
@@ -165,6 +182,11 @@ func newClientConfig() *clientConfig {
 		ClientDialTimeout:       tools.ParseTimeOut(ClientDialTimeout),
 		ReqDefaultTimeout:       ReqDefaultTimeout,
 		ObjQueueMax:             ObjQueueMax,
+		context:                 make(map[string]string),
 	}
 	return conf
+}
+
+func (c *clientConfig) Context() map[string]string {
+	return c.context
 }

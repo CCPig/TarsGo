@@ -5,15 +5,3 @@
 tars-protocol
 examples/*/go.sum
 .DS_Store
-/build/go_build_main_go.exe
-/examples/Tars2Go/base/demo1.go
-/examples/Tars2Go/DemoV1/demo.go
-/examples/Tars2Go/DemoV2/demo.go
-/examples/Tars2Go/DemoV3/V3Test.tars.go
-/examples/TarsPushServer/server/Base/DemoServer/TLOG.log
-/examples/TarsPushServer/server/DemoServer.tarsdat
-/examples/TarsPushServer/go.mod
-/examples/trace/TarsTraceBackServer/go.sum
-/examples/trace/TarsTraceFrontServer/go.sum
-/examples/zipkin/ZipkinTraceClient/go.sum
-/examples/zipkin/ZipkinTraceServer/go.sum

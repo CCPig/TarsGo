@@ -31,11 +31,10 @@ type TarsClient struct {
 	// TODO remove it
 	conn *connection
 
-	cp            ClientProtocol
-	conf          *TarsClientConf
+	protocol      ClientProtocol
+	config        *TarsClientConf
 	sendQueue     chan sendMsg
 	sendFailQueue chan sendMsg
-	// recvQueue chan []byte
 }
 
 type sendMsg struct {
@@ -44,10 +43,10 @@ type sendMsg struct {
 }
 
 type connection struct {
-	tc *TarsClient
+	client *TarsClient
 
 	conn     net.Conn
-	connLock *sync.Mutex
+	connLock sync.Mutex
 
 	isClosed    bool
 	idleTime    time.Time
@@ -56,19 +55,19 @@ type connection struct {
 }
 
 // NewTarsClient new tars client and init it .
-func NewTarsClient(address string, cp ClientProtocol, conf *TarsClientConf) *TarsClient {
-	if conf.QueueLen <= 0 {
-		conf.QueueLen = 100
+func NewTarsClient(address string, protocol ClientProtocol, config *TarsClientConf) *TarsClient {
+	if config.QueueLen <= 0 {
+		config.QueueLen = 100
 	}
-	tc := &TarsClient{
-		conf:          conf,
+	client := &TarsClient{
+		config:        config,
 		address:       address,
-		cp:            cp,
-		sendQueue:     make(chan sendMsg, conf.QueueLen),
+		protocol:      protocol,
+		sendQueue:     make(chan sendMsg, config.QueueLen),
 		sendFailQueue: make(chan sendMsg, 1),
 	}
-	tc.conn = &connection{tc: tc, isClosed: true, connLock: &sync.Mutex{}, dialTimeout: conf.DialTimeout}
-	return tc
+	client.conn = &connection{client: client, isClosed: true, dialTimeout: config.DialTimeout}
+	return client
 }
 
 // ReConnect established the client connection with the server.
@@ -84,17 +83,16 @@ func (tc *TarsClient) Send(req []byte) error {
 
 	// avoid full sendQueue that cause sending block
 	var timerC <-chan struct{}
-	if tc.conf.WriteTimeout > 0 {
-		timerC = rtimer.After(tc.conf.WriteTimeout)
+	if tc.config.WriteTimeout > 0 {
+		timerC = rtimer.After(tc.config.WriteTimeout)
 	}
 
 	select {
 	case <-timerC:
 		return errors.New("tars client write timeout")
 	case tc.sendQueue <- sendMsg{req: req}:
+		return nil
 	}
-
-	return nil
 }
 
 // Close the client connection with the server.
@@ -102,7 +100,7 @@ func (tc *TarsClient) Close() {
 	w := tc.conn
 	if !w.isClosed && w.conn != nil {
 		w.isClosed = true
-		w.conn.Close()
+		_ = w.conn.Close()
 	}
 }
 
@@ -124,6 +122,37 @@ func (tc *TarsClient) GraceClose(ctx context.Context) {
 	}
 }
 
+func (c *connection) ReConnect() (err error) {
+	c.connLock.Lock()
+	defer c.connLock.Unlock()
+	if c.isClosed {
+		TLOG.Debug("Connect:", c.client.address, "Proto:", c.client.config.Proto)
+		if c.client.config.Proto == "ssl" {
+			dialer := &net.Dialer{Timeout: c.dialTimeout}
+			c.conn, err = tls.DialWithDialer(dialer, "tcp", c.client.address, c.client.config.TlsConfig)
+		} else {
+			c.conn, err = net.DialTimeout(c.client.config.Proto, c.client.address, c.dialTimeout)
+		}
+
+		if err != nil {
+			go c.client.protocol.OnClose(c.client.address)
+			return err
+		}
+		if c.client.config.Proto == "tcp" {
+			if c.conn != nil {
+				c.conn.(*net.TCPConn).SetKeepAlive(true)
+			}
+		}
+		c.idleTime = time.Now()
+		c.isClosed = false
+		go c.client.protocol.OnConnect(c.client.address)
+		connDone := make(chan bool, 1)
+		go c.recv(c.conn, connDone)
+		go c.send(c.conn, connDone)
+	}
+	return nil
+}
+
 func (c *connection) send(conn net.Conn, connDone chan bool) {
 	var m sendMsg
 	t := time.NewTicker(time.Second)
@@ -136,16 +165,16 @@ func (c *connection) send(conn net.Conn, connDone chan bool) {
 		}
 		// get sendMsg
 		select {
-		case m = <-c.tc.sendFailQueue: // Send failure queue messages first
+		case m = <-c.client.sendFailQueue: // Send failure queue messages first
 		default:
 			select {
-			case m = <-c.tc.sendQueue: // Fetch jobs
+			case m = <-c.client.sendQueue: // Fetch jobs
 			case <-t.C:
 				if c.isClosed {
 					return
 				}
 				// TODO: check one-way invoke for idle detect
-				if c.invokeNum == 0 && c.idleTime.Add(c.tc.conf.IdleTimeout).Before(time.Now()) {
+				if c.invokeNum == 0 && c.idleTime.Add(c.client.config.IdleTimeout).Before(time.Now()) {
 					c.close(conn)
 					return
 				}
@@ -153,17 +182,27 @@ func (c *connection) send(conn net.Conn, connDone chan bool) {
 			}
 		}
 		atomic.AddInt32(&c.invokeNum, 1)
-		if c.tc.conf.WriteTimeout != 0 {
-			conn.SetWriteDeadline(time.Now().Add(c.tc.conf.WriteTimeout))
+		if c.client.config.WriteTimeout != 0 {
+			if err := conn.SetWriteDeadline(time.Now().Add(c.client.config.WriteTimeout)); err != nil {
+				TLOG.Errorf("set write deadline error: %v", err)
+			}
 		}
 		c.idleTime = time.Now()
 		_, err := conn.Write(m.req)
 		if err != nil {
 			// TODO add retry times
 			m.retry++
-			c.tc.sendFailQueue <- m
 			TLOG.Errorf("send request retry: %d, error: %v", m.retry, err)
+			c.client.sendFailQueue <- m
 			c.close(conn)
+			if err != net.ErrClosed {
+				return
+			}
+
+			// connection closed, try to reconnect once
+			if err = c.ReConnect(); err != nil {
+				TLOG.Errorf("send request reconnect error: %v", err)
+			}
 			return
 		}
 	}
@@ -178,12 +217,14 @@ func (c *connection) recv(conn net.Conn, connDone chan bool) {
 	var n int
 	var err error
 	for {
-		if c.tc.conf.ReadTimeout != 0 {
-			conn.SetReadDeadline(time.Now().Add(c.tc.conf.ReadTimeout))
+		if c.client.config.ReadTimeout != 0 {
+			if err = conn.SetReadDeadline(time.Now().Add(c.client.config.ReadTimeout)); err != nil {
+				TLOG.Errorf("set read deadline error: %v", err)
+			}
 		}
 		n, err = conn.Read(buffer)
 		if err != nil {
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() && netErr.Temporary() {
+			if isNoDataError(err) {
 				continue // no data, not error
 			}
 			if _, ok := err.(*net.OpError); ok {
@@ -194,14 +235,14 @@ func (c *connection) recv(conn net.Conn, connDone chan bool) {
 			if err == io.EOF {
 				TLOG.Debugf("connection closed by remote: %v, error: %v", conn.RemoteAddr(), err)
 			} else {
-				TLOG.Error("read package error:", err)
+				TLOG.Errorf("read package error: %v", err)
 			}
 			c.close(conn)
 			return
 		}
 		currBuffer = append(currBuffer, buffer[:n]...)
 		for {
-			pkgLen, status := c.tc.cp.ParsePackage(currBuffer)
+			pkgLen, status := c.client.protocol.ParsePackage(currBuffer)
 			if status == PackageLess {
 				break
 			}
@@ -210,7 +251,7 @@ func (c *connection) recv(conn net.Conn, connDone chan bool) {
 				pkg := make([]byte, pkgLen)
 				copy(pkg, currBuffer[0:pkgLen])
 				currBuffer = currBuffer[pkgLen:]
-				go c.tc.cp.Recv(pkg)
+				go c.client.protocol.Recv(pkg)
 				if len(currBuffer) > 0 {
 					continue
 				}
@@ -224,43 +265,12 @@ func (c *connection) recv(conn net.Conn, connDone chan bool) {
 	}
 }
 
-func (c *connection) ReConnect() (err error) {
-	c.connLock.Lock()
-	defer c.connLock.Unlock()
-	if c.isClosed {
-		TLOG.Debug("Connect:", c.tc.address, "Proto:", c.tc.conf.Proto)
-		if c.tc.conf.Proto == "ssl" {
-			dialer := &net.Dialer{Timeout: c.dialTimeout}
-			c.conn, err = tls.DialWithDialer(dialer, "tcp", c.tc.address, c.tc.conf.TlsConfig)
-		} else {
-			c.conn, err = net.DialTimeout(c.tc.conf.Proto, c.tc.address, c.dialTimeout)
-		}
-
-		if err != nil {
-			go c.tc.cp.OnClose(c.tc.address)
-			return err
-		}
-		if c.tc.conf.Proto == "tcp" {
-			if c.conn != nil {
-				c.conn.(*net.TCPConn).SetKeepAlive(true)
-			}
-		}
-		c.idleTime = time.Now()
-		c.isClosed = false
-		go c.tc.cp.OnConnect(c.tc.address)
-		connDone := make(chan bool, 1)
-		go c.recv(c.conn, connDone)
-		go c.send(c.conn, connDone)
-	}
-	return nil
-}
-
 func (c *connection) close(conn net.Conn) {
 	c.connLock.Lock()
 	defer c.connLock.Unlock()
 	c.isClosed = true
 	if conn != nil {
-		conn.Close()
+		_ = conn.Close()
 	}
-	go c.tc.cp.OnClose(c.tc.address)
+	go c.client.protocol.OnClose(c.client.address)
 }
